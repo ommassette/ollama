@@ -1,0 +1,20 @@
+why I used logging:
+1. structured tracking
+2. I use it for debugging especially when I am making production grade projects
+3. I use it for Error Diagnosis
+4. Logging helps with audit and monitoring
+
+why I imported list, dict and optional
+
+1. Defines the exact structure for st.session_state.messages, a list of dictionaries containing string keys (role, content) and string values.
+
+2. Explicitly shows that a function returns a str on success or None on failure/error.
+
+3. Enables automatic type checking (MyPy/Pylance) and provides accurate IDE autocompletion.
+
+4. Makes function inputs and return types clear instantly without needing extra comments.
+
+
+I also managed to use side bars and dividers via stream lit documentations https://docs.streamlit.io/.
+
+I am using Gemmma Model dubbed Saimon in this project. 
