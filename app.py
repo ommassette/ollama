@@ -1,114 +1,122 @@
+import logging
 import os
-import sys
-import warnings
-import numpy as np
+import re
+from pathlib import Path
+from typing import List
+
+import chromadb
 import ollama
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-warnings.filterwarnings("ignore")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-EMBEDDING_MODEL = "nomic-embed-text-v2-moe"
+MODEL = "Saimon:latest"
+EMBED_MODEL = "nomic-embed-text-v2-moe"
 
-
-def load_document_chunks(file_path: str):
-    if not os.path.exists(file_path):
-        print(f"File not found: {file_path}")
-        return []
-
-    if file_path.endswith(".pdf"):
-        loader = PyPDFLoader(file_path)
-    elif file_path.endswith(".txt"):
-        loader = TextLoader(file_path, encoding="utf-8")
-    else:
-        print("Unsupported format. Use .pdf or .txt")
-        return []
-
-    docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=150, chunk_overlap=50)
-    return splitter.split_documents(docs)
-
-def clean_document_text(text):
-    # Remove extra whitespace and newlines
-    cleaned_text = ' '.join(text.split())
-    return cleaned_text
-
-def get_embedding(text):
-    response = ollama.embed(model=EMBEDDING_MODEL, input=text)
-    return np.array(response.embeddings[0])
+chroma_client = chromadb.PersistentClient(path="CHROMA")
+collection_research = chroma_client.get_or_create_collection(name="CHROMA")
 
 
-def cosine_similarity(vec1, vec2):
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+def clean_text(text: str) -> str:
+    text = re.sub(r'-\n(\w)', r'\1', text)
+    text = text.replace('•', '\n- ')
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
-def search_documents(query_text, document_embeddings, top_k=3):
-    if not document_embeddings:
-        print("\nNo document embeddings found. Please add a document first.")
-        return
-
-    print("\nGenerating query embedding...")
-    query_vec = get_embedding(query_text)
-
-    scores = []
-    for item in document_embeddings:
-        sim = cosine_similarity(query_vec, item["embedding"])
-        scores.append((sim, item["text"], item["source"]))
-
-    scores.sort(key=lambda x: x[0], reverse=True)
-
-    print(f"\n--- Top {min(top_k, len(scores))} Results ---")
-    for idx, (score, text, source) in enumerate(scores[:top_k], start=1):
-        print(f"\nResult {idx} (Score: {score:.4f}) [{source}]:")
-        print(f"\"{text.strip()}\"")
+def create_embedding(text: str) -> List[float]:
+    response = ollama.embed(model=EMBED_MODEL, input=text)
+    return response.embeddings[0]
 
 
-def main():
-    document_embeddings = []
+def process_and_ingest_files(file_paths: List[str]) -> None:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    
+    for file_path in file_paths:
+        path = Path(file_path)
+        if not path.exists():
+            logging.error(f"File not found: {file_path}")
+            continue
 
-    while True:
-        print("\n" + "=" * 40)
-        print("1. Would you like to add a document?")
-        print("2. Enter your query based on the document")
-        print("3. Close program")
-        print("=" * 40)
-
-        choice = input("Select an option (1-3): ").strip()
-
-        if choice == "1":
-            file_path = input("Enter path to PDF or TXT file: ").strip().strip('"\'')
-            chunks = load_document_chunks(file_path)
-
-            if not chunks:
-                continue
-
-            print(f"Processing and embedding {len(chunks)} chunks...")
-            for chunk in chunks:
-                cleaned_text = clean_document_text(chunk.page_content)
-                emb = get_embedding(cleaned_text)
-                document_embeddings.append({
-                    "embedding": emb,
-                    "text": cleaned_text,
-                    "source": os.path.basename(file_path)
-                })
-            print(f"Successfully added {len(chunks)} chunks to embedding list. Total store size: {len(document_embeddings)}.")
-
-        elif choice == "2":
-            if not document_embeddings:
-                print("\nDocument list is empty! Please add a document first.")
-                continue
-
-            query = input("Enter your query: ").strip()
-            if query:
-                search_documents(query, document_embeddings, top_k=3)
-
-        elif choice == "3":
-            print("Exiting program.")
-            sys.exit(0)
-
+        logging.info(f"Processing file: {file_path}")
+        if path.suffix.lower() == ".pdf":
+            loader = PyPDFLoader(file_path)
         else:
-            print("Invalid option. Please enter 1, 2, or 3.")
+            loader = TextLoader(file_path)
+
+        pages = loader.load()
+        for page in pages:
+            page.page_content = clean_text(page.page_content)
+
+        chunks = splitter.split_documents(pages)
+        
+        ids = []
+        documents = []
+        metadatas = []
+        embeddings = []
+
+        for idx, chunk in enumerate(chunks):
+            chunk_id = f"{path.stem}_{idx}"
+            embedding = create_embedding(chunk.page_content)
+
+            ids.append(chunk_id)
+            documents.append(chunk.page_content)
+            metadatas.append({"source": str(path)})
+            embeddings.append(embedding)
+
+        if ids:
+            collection_research.upsert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+                embeddings=embeddings
+            )
+            logging.info(f"Successfully indexed {len(ids)} chunks from {file_path}")
+
+
+def retrieve_from_vector_db(query: str, k: int = 4) -> List[str]:
+    query_emb = create_embedding(query)
+    response = collection_research.query(
+        query_texts=[query],
+        n_results=k,
+        query_embeddings=[query_emb],
+    )
+    return response["documents"][0]
+
+
+def answer(question: str, k: int = 4) -> str:
+    chunks = retrieve_from_vector_db(question, k=k)
+    context = "\n\n---\n\n".join(chunks)
+    prompt = f"""Answer the question using only the context below.
+If the context does not contain the answer, say "I don't know based on the document."
+
+Context:
+{context}
+
+Question: {question}"""
+
+    resp = ollama.chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0},
+    )
+    return resp.message.content
 
 
 if __name__ == "__main__":
-    main()
+    raw_paths = input("Enter file paths (separated by commas): ")
+    docs_to_upload = [p.strip() for p in raw_paths.split(",") if p.strip()]
+
+    if docs_to_upload:
+        process_and_ingest_files(docs_to_upload)
+
+    user_query = input("Enter your question: ").strip()
+    if user_query:
+        logging.info(f"Querying: {user_query}")
+        result = answer(user_query)
+        logging.info(f"Response:\n{result}")
